@@ -20,16 +20,10 @@ export async function proxy(request, env) {
     if (value) headers.set(name, value);
   }
 
-  // Browser POST uploads are stored without Cache-Control, so uploads/ keys (random, never rewritten) get an explicit TTL.
-  const isUpload = pathname.startsWith(`/${env.BUCKET}/uploads/`);
-  const cf = { cacheEverything: true };
-  if (isUpload) cf.cacheTtlByStatus = { '200-299': 86400 };
+  const upstreamRes = await fetch(upstream, { method: request.method, headers, cf: { cacheEverything: true } });
 
-  const upstreamRes = await fetch(upstream, { method: request.method, headers, cf });
-
-  // Object bytes are user-supplied, so stop browsers from sniffing them into something other than the stored image type.
+  // Stop browsers from sniffing object bytes into something other than the stored content type.
   const res = new Response(upstreamRes.body, upstreamRes);
   res.headers.set('X-Content-Type-Options', 'nosniff');
-  if (isUpload && !res.headers.has('Cache-Control')) res.headers.set('Cache-Control', 'public, max-age=86400, immutable');
   return res;
 }

@@ -3,18 +3,5 @@ main = "src/index.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-NEON_AUTH_AUDIENCE = "https://ep-weathered-glade-b4s5dxbo.neonauth.c-6.us-east-2.aws.neon.tech"
-NEON_AUTH_ISSUER = "https://ep-weathered-glade-b4s5dxbo.neonauth.c-6.us-east-2.aws.neon.tech"
-NEON_AUTH_JWKS_URL = "https://ep-weathered-glade-b4s5dxbo.neonauth.c-6.us-east-2.aws.neon.tech/neondb/auth/.well-known/jwks.json"
-NEON_AUTH_URL = "https://ep-weathered-glade-b4s5dxbo.neonauth.c-6.us-east-2.aws.neon.tech/neondb/auth"
 NEON_STORAGE_ORIGIN = "https://br-old-bread-b4ztoa2k.storage.c-6.us-east-2.aws.neon.tech"
 BUCKET = "cdn-demo"
-REGION = "us-east-2"
-
-[triggers]
-crons = ["0 * * * *"]
-
-[[ratelimits]]
-name = "UPLOAD_LIMITER"
-namespace_id = "1001"
-simple = { limit = 5, period = 60 }

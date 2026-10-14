@@ -55,17 +55,11 @@ describe('proxy guards', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('adds nosniff, and a long TTL for uploads/ which the POST path cannot label', async () => {
-    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('x', { headers: { 'Content-Type': 'image/png' } }));
-    const res = await call('/cdn-demo/uploads/u.png');
-    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
-    expect(res.headers.get('Cache-Control')).toBe('public, max-age=86400, immutable');
-    expect(spy.mock.calls[0][1].cf.cacheTtlByStatus).toEqual({ '200-299': 86400 });
-  });
-
-  it('does not override origin Cache-Control on samples/', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('x', { headers: { 'Cache-Control': 'public, max-age=60' } }));
+  it('adds nosniff and leaves origin Cache-Control alone', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('x', { headers: { 'Cache-Control': 'public, max-age=60' } }));
     const res = await call('/cdn-demo/samples/a.png');
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(res.headers.get('Cache-Control')).toBe('public, max-age=60');
+    expect(spy.mock.calls[0][1].cf).toEqual({ cacheEverything: true });
   });
 });

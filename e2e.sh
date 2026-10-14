@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end checks against the deployed demo.
 # Usage: ./e2e.sh https://<name>.<subdomain>.workers.dev [bucket]
-# Needs curl and jq. It signs up a throwaway user through the Worker's /api/auth proxy (email + password) and
-# uploads as that user. One run makes 4 authenticated /api/upload-url calls; the limiter allows 5 per minute
-# per location, so wait a minute between back-to-back runs. Throwaway users (e2e-*@example.com) stay in the
-# project's neon_auth schema.
+# Needs curl, jq and sha256sum. Origin comparison uses the storage origin from wrangler.toml.
 set -u
 
 BASE=${1:?usage: e2e.sh <worker-url> [bucket]}
 BASE=${BASE%/}
 BUCKET=${2:-cdn-demo}
-MAX=$((2 * 1024 * 1024))
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ORIGIN=$(sed -n 's/^NEON_STORAGE_ORIGIN *= *"\(.*\)"/\1/p' "$ROOT/wrangler.toml")
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -22,77 +20,23 @@ check() { if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1: got '$2', want '$
 status_of() { head -n1 "$1" | tr -d '\r' | awk '{print $2}'; }
 header_of() { grep -i "^$2:" "$1" | tail -n1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//'; }
 
-TOKEN=""
-# upload_url TYPE SIZE: writes the response to $tmp/up.json and prints the HTTP status. Sends $TOKEN as a bearer
-# token when set. Waits out a 429 once.
-upload_url() {
-  local code auth=()
-  [ -n "$TOKEN" ] && auth=(-H "Authorization: Bearer $TOKEN")
-  for _ in 1 2; do
-    code=$(curl -sS -o "$tmp/up.json" -w '%{http_code}' -X POST "$BASE/api/upload-url" ${auth[@]+"${auth[@]}"} \
-      -H 'Content-Type: application/json' -d "{\"contentType\":\"$1\",\"size\":$2}")
-    [ "$code" = 429 ] || break
-    echo "      rate limited, waiting 61s" >&2; sleep 61
-  done
-  echo "$code"
-}
-
-# post_form FILE TYPE [OVERRIDE_TYPE]: multipart POST of the policy in $tmp/up.json straight to storage.
-post_form() {
-  local args=() k v
-  while IFS=$'\t' read -r k v; do
-    [ "$k" = Content-Type ] && [ -n "${3:-}" ] && v=$3
-    args+=(--form-string "$k=$v")
-  done < <(jq -r '.fields | to_entries[] | [.key, .value] | @tsv' "$tmp/up.json")
-  curl -sS -o "$tmp/post.out" -w '%{http_code}' "${args[@]}" -F "file=@$1;type=$2" "$(jq -r .url "$tmp/up.json")"
-}
-
-# 1. Gallery.
+# 1. Gallery lists the six samples.
 code=$(curl -sS -o "$tmp/index.html" -w '%{http_code}' "$BASE/")
 check "GET / gallery" "$code" 200
-grep -q 'deleted after 24h' "$tmp/index.html" && ok "gallery shows the demo notice" || bad "gallery is missing the demo notice"
+n=$(grep -o 'samples/sample-[0-9]\.png' "$tmp/index.html" | sort -u | wc -l | tr -d ' ')
+check "gallery references 6 sample images" "$n" 6
 
-# 2. Listing returns the samples, newest first.
-curl -sS "$BASE/api/list" >"$tmp/list.json"
-samples=$(jq '[.objects[] | select(.key | startswith("samples/"))] | length' "$tmp/list.json" 2>/dev/null || echo 0)
-[ "${samples:-0}" -ge 1 ] && ok "GET /api/list returns $samples sample(s)" || bad "GET /api/list returned no samples"
-sample=$(jq -r '[.objects[] | select(.key | startswith("samples/"))][0].key' "$tmp/list.json")
+# 2. Each sample matches the origin byte for byte.
+for i in 1 2 3 4 5 6; do
+  key="samples/sample-$i.png"
+  curl -sS -o "$tmp/w.bin" -w '%{http_code}' "$BASE/$BUCKET/$key" >"$tmp/code"
+  curl -sS -o "$tmp/o.bin" "$ORIGIN/$BUCKET/$key"
+  check "GET $key" "$(cat "$tmp/code")" 200
+  [ "$(sha256sum <"$tmp/w.bin")" = "$(sha256sum <"$tmp/o.bin")" ] && ok "$key sha256 matches the origin" || bad "$key differs from the origin"
+done
 
-# 3. Uploads need a Neon Auth session.
-check "POST /api/upload-url without a token" "$(upload_url image/png 100)" 401
-check "POST /api/upload-url with a garbage token" "$(TOKEN=not.a.jwt upload_url image/png 100)" 401
-
-email="e2e-$(date +%s)-$RANDOM@example.com"
-password="E2e-$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')-pw1"
-auth_post() { # PATH JSON: POST through the Worker's auth proxy, keeping cookies in the jar
-  curl -sS -D "$tmp/hauth" -o "$tmp/auth.json" -w '%{http_code}' -c "$tmp/jar" -b "$tmp/jar" -H "Origin: $BASE" \
-    -H 'Content-Type: application/json' -d "$2" "$BASE/api/auth/$1"
-}
-check "sign up $email through /api/auth" "$(auth_post sign-up/email "$(jq -nc --arg e "$email" --arg p "$password" '{email:$e,password:$p,name:"e2e"}')")" 200
-user_id=$(jq -r '.user.id // empty' "$tmp/auth.json")
-[ -n "$user_id" ] && ok "sign-up returned a user id" || bad "sign-up returned no user id"
-grep -qi '^set-cookie: __Secure-neon-auth' "$tmp/hauth" && ok "sign-up set the session cookie" || bad "sign-up set no session cookie"
-if grep -i '^set-cookie:' "$tmp/hauth" | grep -qiE 'partitioned|samesite=none'; then bad "session cookie is still third-party style (Partitioned/SameSite=None)"; else ok "session cookie is first-party (no Partitioned, not SameSite=None)"; fi
-curl -sS -D "$tmp/hs" -o "$tmp/session.json" -b "$tmp/jar" "$BASE/api/auth/get-session"
-check "GET /api/auth/get-session" "$(status_of "$tmp/hs")" 200
-check "session email" "$(jq -r '.user.email' "$tmp/session.json")" "$email"
-TOKEN=$(header_of "$tmp/hs" set-auth-jwt)
-[ -n "$TOKEN" ] && ok "session yields a JWT (set-auth-jwt)" || bad "no set-auth-jwt header"
-check "auth proxy blocks routes outside the allowlist" "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/auth/admin/list-users")" 404
-
-# Upload through a presigned POST policy as that user, then read it back through the CDN path.
-printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==' | base64 -d >"$tmp/pixel.png"
-check "POST /api/upload-url (image/png)" "$(upload_url image/png "$(wc -c <"$tmp/pixel.png")")" 200
-key=$(jq -r .key "$tmp/up.json")
-case "$key" in "uploads/$user_id/"*.png) ok "server chose the key under the user id ($key)";; *) bad "unexpected key '$key'";; esac
-code=$(post_form "$tmp/pixel.png" image/png)
-case "$code" in 201|204) ok "multipart POST to storage ($code)";; *) bad "multipart POST to storage: $code $(head -c 200 "$tmp/post.out")";; esac
-
-URL="$BASE/$BUCKET/$key"
-curl -sS -D "$tmp/h1" -o "$tmp/got.png" "$URL"
-check "GET uploaded object via proxy" "$(status_of "$tmp/h1")" 200
-cmp -s "$tmp/got.png" "$tmp/pixel.png" && ok "bytes match the upload" || bad "bytes differ from the upload"
-check "content-type" "$(header_of "$tmp/h1" content-type)" image/png
+# 3. A repeat request is served from the edge cache.
+URL="$BASE/$BUCKET/samples/sample-1.png"
 hit=""
 for _ in 1 2 3 4 5; do
   sleep 1
@@ -100,38 +44,25 @@ for _ in 1 2 3 4 5; do
   hit=$(header_of "$tmp/h2" cf-cache-status)
   [ "$hit" = HIT ] && break
 done
-check "second GET cf-cache-status" "$hit" HIT
+check "repeat GET cf-cache-status" "$hit" HIT
 
-# 4. Range and conditional requests on a sample (ones from setup.sh are a few KB).
-SURL="$BASE/$BUCKET/$sample"
-curl -sS -D "$tmp/h3" -o "$tmp/range.bin" -H 'Range: bytes=0-99' "$SURL"
+# 4. Range and conditional requests.
+curl -sS -D "$tmp/h3" -o "$tmp/range.bin" -H 'Range: bytes=0-99' "$URL"
 check "Range bytes=0-99" "$(status_of "$tmp/h3")" 206
 check "range length" "$(wc -c <"$tmp/range.bin" | tr -d ' ')" 100
-curl -sS -D "$tmp/h4" -o /dev/null "$SURL"
+curl -sS -D "$tmp/h4" -o /dev/null "$URL"
 etag=$(header_of "$tmp/h4" etag)
-code=$(curl -sS -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag" "$SURL")
-check "If-None-Match $etag" "$code" 304
+check "If-None-Match $etag" "$(curl -sS -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag" "$URL")" 304
+check "nosniff header" "$(header_of "$tmp/h4" x-content-type-options)" nosniff
 
-# 5. Rejections (still authenticated).
-check "oversize declared size is refused by the Worker" "$(upload_url image/png $((MAX + 1)))" 400
-check "non-image type is refused by the Worker" "$(upload_url text/html 100)" 400
-
-# Reuse one valid policy for direct-to-storage abuse attempts.
-upload_url image/png 100 >/dev/null
-head -c $((MAX + 1)) /dev/zero >"$tmp/big.png"
-code=$(post_form "$tmp/big.png" image/png)
-[ "$code" -ge 400 ] && ok "oversize body is refused by storage ($code)" || bad "oversize body accepted by storage ($code)"
-printf '<script>1</script>' >"$tmp/x.html"
-code=$(post_form "$tmp/x.html" text/html text/html)
-[ "$code" -ge 400 ] && ok "non-image Content-Type is refused by storage ($code)" || bad "non-image Content-Type accepted by storage ($code)"
-code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT --data x "$URL")
-check "PUT through the proxy" "$code" 405
-
-# 6. The proxy only serves the demo bucket.
-for p in "/other-bucket/x.png" "//example.com/$BUCKET/x.png" "/$BUCKET/../other/x.png"; do
+# 5. Guards.
+check "POST through the proxy" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST --data x "$URL")" 405
+for p in "/other-bucket/x.png" "/$BUCKET/../other/x.png"; do
   code=$(curl -sS --path-as-is -o /dev/null -w '%{http_code}' "$BASE$p")
   case "$code" in 403|404) ok "GET $p blocked ($code)";; *) bad "GET $p returned $code";; esac
 done
+# //evil.com/x must not reach evil.com: the Worker answers 403 itself (not under the bucket).
+check "GET //evil.com/x stays on the Worker" "$(curl -sS --path-as-is -o /dev/null -w '%{http_code}' "$BASE//evil.com/x")" 403
 
 echo
 echo "$pass passed, $fail failed"

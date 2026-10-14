@@ -3,7 +3,7 @@
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BUCKET=cdn-demo
-CRED_NAME=cdn-demo-worker
+CRED_NAME=cdn-demo-setup
 NEON_API=${NEON_API:-https://console.neon.tech/api/v2}
 
 if [ -z "${NEON_API_KEY:-}" ] && [ -f "$ROOT/.env" ]; then
@@ -47,14 +47,4 @@ worker_origin() {
     "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain // empty')
   [ -n "$sub" ] || { echo "No workers.dev subdomain on this account yet." >&2; return 1; }
   echo "https://$WORKER_NAME.$sub.workers.dev"
-}
-
-# set_var KEY VALUE: sets a string in wrangler.toml [vars], adding it if missing.
-set_var() {
-  local k=$1 v=$2
-  if grep -q "^$k *=" "$ROOT/wrangler.toml"; then
-    sed -i -E "s|^$k *=.*|$k = \"$v\"|" "$ROOT/wrangler.toml"
-  else
-    sed -i -E "/^\[vars\]/a $k = \"$v\"" "$ROOT/wrangler.toml"
-  fi
 }
