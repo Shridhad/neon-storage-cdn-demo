@@ -30,7 +30,7 @@ describe('proxy guards', () => {
     expect(url).toBe(env.NEON_STORAGE_ORIGIN + '/cdn-demo//evil.example/a.png');
   });
 
-  it('forwards only Range and If-None-Match and drops the query', async () => {
+  it('forwards only Range, If-None-Match and If-Modified-Since and drops the query', async () => {
     const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('x'));
     await call('/cdn-demo/samples/a.png?bust=1', {
       headers: {
@@ -38,12 +38,13 @@ describe('proxy guards', () => {
         Cookie: 'sid=1',
         Range: 'bytes=0-9',
         'If-None-Match': '"abc"',
+        'If-Modified-Since': 'Wed, 21 Oct 2026 07:28:00 GMT',
         'X-Other': 'nope',
       },
     });
     const [url, init] = spy.mock.calls[0];
     expect(url).toBe(env.NEON_STORAGE_ORIGIN + '/cdn-demo/samples/a.png');
-    expect([...init.headers.keys()].sort()).toEqual(['if-none-match', 'range']);
+    expect([...init.headers.keys()].sort()).toEqual(['if-modified-since', 'if-none-match', 'range']);
     expect(init.cf).toMatchObject({ cacheEverything: true });
   });
 
@@ -61,5 +62,39 @@ describe('proxy guards', () => {
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(res.headers.get('Cache-Control')).toBe('public, max-age=60');
     expect(spy.mock.calls[0][1].cf).toEqual({ cacheEverything: true });
+  });
+});
+
+describe('response headers', () => {
+  it('strips x-amz-* headers, keeps the rest and the body, and preserves status', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('hello', {
+        status: 206,
+        headers: {
+          'X-Amz-Request-Id': 'abc',
+          'x-amz-version-id': 'null',
+          'Content-Type': 'image/png',
+          ETag: '"e1"',
+          'Last-Modified': 'Wed, 21 Oct 2026 07:28:00 GMT',
+          'Accept-Ranges': 'bytes',
+        },
+      })
+    );
+    const res = await call('/cdn-demo/samples/a.png');
+    expect(res.status).toBe(206);
+    expect([...res.headers.keys()].filter((k) => k.startsWith('x-amz-'))).toEqual([]);
+    expect(res.headers.get('Content-Type')).toBe('image/png');
+    expect(res.headers.get('ETag')).toBe('"e1"');
+    expect(res.headers.get('Last-Modified')).toBe('Wed, 21 Oct 2026 07:28:00 GMT');
+    expect(res.headers.get('Accept-Ranges')).toBe('bytes');
+    expect(await res.text()).toBe('hello');
+  });
+
+  it('passes a bodiless 304 through', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 304, headers: { 'x-amz-request-id': 'abc', ETag: '"e1"' } }));
+    const res = await call('/cdn-demo/samples/a.png');
+    expect(res.status).toBe(304);
+    expect(res.headers.get('x-amz-request-id')).toBeNull();
+    expect(res.headers.get('ETag')).toBe('"e1"');
   });
 });

@@ -15,7 +15,7 @@ A one-Worker demo of the proxy from the ["Serve objects through a CDN (Cloudflar
 | `GET /` | Gallery page. Each tile shows the `cf-cache-status` (MISS, then HIT on reload) and load time. The image list is a static manifest in `src/samples.js`. |
 | `GET\|HEAD /cdn-demo/<key>` | The guide's cached proxy, restricted to the demo bucket. |
 
-`src/proxy.js` is the guide's Worker: the upstream is built by string concatenation onto the fixed origin (a `//host` path can't replace it), only `Range` and `If-None-Match` are forwarded, the query string is dropped, and `X-Content-Type-Options: nosniff` is added. It also rejects any path outside the demo bucket. The Worker holds no credentials.
+`src/proxy.js` is the guide's Worker: the upstream is built by string concatenation onto the fixed origin (a `//host` path can't replace it), only `Range`, `If-None-Match` and `If-Modified-Since` are forwarded, the query string is dropped, `x-amz-*` response headers are stripped, and `X-Content-Type-Options: nosniff` is added. It also rejects any path outside the demo bucket. The Worker holds no credentials.
 
 ## Setup, deploy, teardown
 

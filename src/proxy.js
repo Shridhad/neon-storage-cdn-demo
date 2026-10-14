@@ -15,15 +15,24 @@ export async function proxy(request, env) {
   // Forward only what is needed for partial and conditional requests.
   // Authorization and cookies are never sent to the origin.
   const headers = new Headers();
-  for (const name of ['Range', 'If-None-Match']) {
+  for (const name of ['Range', 'If-None-Match', 'If-Modified-Since']) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
 
   const upstreamRes = await fetch(upstream, { method: request.method, headers, cf: { cacheEverything: true } });
 
-  // Stop browsers from sniffing object bytes into something other than the stored content type.
-  const res = new Response(upstreamRes.body, upstreamRes);
-  res.headers.set('X-Content-Type-Options', 'nosniff');
-  return res;
+  // Drop the origin's x-amz-* headers (request and version IDs) and stop browsers from sniffing
+  // object bytes into something other than the stored content type. The body is passed through
+  // as a stream.
+  const responseHeaders = new Headers(upstreamRes.headers);
+  for (const name of [...responseHeaders.keys()]) {
+    if (name.startsWith('x-amz-')) responseHeaders.delete(name);
+  }
+  responseHeaders.set('X-Content-Type-Options', 'nosniff');
+  return new Response(upstreamRes.body, {
+    status: upstreamRes.status,
+    statusText: upstreamRes.statusText,
+    headers: responseHeaders,
+  });
 }
