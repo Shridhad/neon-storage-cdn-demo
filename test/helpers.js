@@ -12,3 +12,14 @@ export function listXml(items) {
     .join('');
   return `<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`;
 }
+
+// Shaped like the values setup-auth.sh writes: the auth URL carries /<db>/auth, while iss/aud are its bare origin
+// (verified against a live Neon Auth token).
+export const AUTH_ORIGIN = 'https://ep-test-1234.neonauth.c-2.us-east-2.aws.neon.tech';
+export const authEnv = {
+  ...env,
+  NEON_AUTH_URL: `${AUTH_ORIGIN}/neondb/auth`,
+  NEON_AUTH_JWKS_URL: `${AUTH_ORIGIN}/neondb/auth/.well-known/jwks.json`,
+  NEON_AUTH_ISSUER: AUTH_ORIGIN,
+  NEON_AUTH_AUDIENCE: AUTH_ORIGIN,
+};

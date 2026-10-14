@@ -21,18 +21,30 @@ export const PAGE = `<!doctype html>
   .HIT { color: var(--hit); } .MISS, .EXPIRED, .REVALIDATED { color: var(--miss); }
   code, pre { font-family: ui-monospace, monospace; font-size: 12.5px; }
   pre { overflow-x: auto; margin: 8px 0 0; }
-  #status { color: var(--mute); margin-left: 8px; }
+  #status, #authmsg { color: var(--mute); margin-left: 8px; }
+  input[type=email], input[type=password] { padding: 4px 6px; margin-right: 4px; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
   <h1>Neon Object Storage behind a Cloudflare CDN</h1>
   <div>One Worker serves this page, lists the bucket, signs uploads and caches images at the edge.</div>
-  <div class="notice">Demo: uploads are public and deleted after 24h. Images only (PNG, JPEG, WebP, GIF), 2 MiB max.</div>
+  <div class="notice">Demo: browsing is public, uploading needs an account. Uploads are public and deleted after 24h. Images only (PNG, JPEG, WebP, GIF), 2 MiB max.</div>
 
   <div class="card">
-    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
-    <button id="upload">Upload</button><span id="status"></span>
+    <div id="signedout">
+      <strong>Sign in to upload</strong>
+      <input id="email" type="email" autocomplete="username" placeholder="email">
+      <input id="password" type="password" autocomplete="current-password" placeholder="password (8+ characters)">
+      <button id="signin">Sign in</button> <button id="signup">Sign up</button><span id="authmsg"></span>
+    </div>
+    <div id="signedin" hidden>Signed in as <strong id="who"></strong> <button id="signout">Sign out</button></div>
+  </div>
+
+  <div class="card" id="uploadcard">
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled>
+    <button id="upload" disabled>Upload</button><span id="status">Sign in to upload.</span>
   </div>
 
   <div id="grid" class="grid"></div>
@@ -41,10 +53,11 @@ export const PAGE = `<!doctype html>
   <div class="card">
     <strong>How it works</strong>
 <pre>browser --GET /bucket/key--&gt; Worker (cache: cf.cacheEverything) --&gt; Neon Object Storage (public_read bucket)
-browser --POST /api/upload-url--&gt; Worker signs a POST policy (key, type, size, 5 min)
+browser --/api/auth/*----------&gt; Worker --&gt; Neon Auth (sign-in; first-party session cookie)
+browser --POST /api/upload-url--&gt; Worker verifies the Neon Auth JWT (JWKS), then signs a POST policy (key, type, size, 5 min)
 browser --multipart POST--------&gt; Neon Object Storage directly (bucket CORS allows this origin)
 cron (hourly) Worker deletes uploads/ older than 24h</pre>
-    Reads go through the Worker so repeat requests are answered from Cloudflare's edge. Uploads skip the Worker so image bytes never count against its limits. The storage credential only exists as a Worker secret.
+    Only <code>/api/upload-url</code> needs a session; the gallery and images are public. Reads go through the Worker so repeat requests are answered from Cloudflare's edge. Uploads skip the Worker so image bytes never count against its limits. The storage credential only exists as a Worker secret.
   </div>
 </main>
 <script>
@@ -73,6 +86,63 @@ function tile(bucket, obj) {
   return el;
 }
 
+var session = { jwt: null, user: null };
+var $ = function (id) { return document.getElementById(id); };
+
+function render() {
+  var signedIn = !!session.user;
+  $('signedout').hidden = signedIn;
+  $('signedin').hidden = !signedIn;
+  $('who').textContent = signedIn ? session.user.email : '';
+  $('file').disabled = !signedIn;
+  $('upload').disabled = !signedIn;
+  if (!signedIn) statusEl.textContent = 'Sign in to upload.';
+  else if (statusEl.textContent === 'Sign in to upload.') statusEl.textContent = '';
+}
+
+function authApi(path, init) {
+  return fetch('/api/auth/' + path, Object.assign({ credentials: 'same-origin' }, init));
+}
+
+// Reads the session cookie through the Worker. The JWT arrives in the set-auth-jwt header and lives about 15 minutes,
+// so it is fetched again before each upload instead of being stored.
+function refreshSession() {
+  return authApi('get-session').then(function (r) {
+    var jwt = r.headers.get('set-auth-jwt');
+    return r.json().catch(function () { return null; }).then(function (d) {
+      session.user = d && d.user ? d.user : null;
+      session.jwt = session.user ? jwt : null;
+      render();
+      return session.jwt;
+    });
+  }).catch(function () { session.user = null; session.jwt = null; render(); return null; });
+}
+
+function submitCredentials(path) {
+  var email = $('email').value.trim();
+  var password = $('password').value;
+  if (!email || !password) { $('authmsg').textContent = 'Enter an email and password.'; return; }
+  $('authmsg').textContent = '...';
+  var body = { email: email, password: password };
+  if (path === 'sign-up/email') body.name = email.split('@')[0];
+  authApi(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error(j.message || 'request failed (' + r.status + ')');
+        $('password').value = '';
+        $('authmsg').textContent = '';
+        return refreshSession();
+      });
+    })
+    .catch(function (e) { $('authmsg').textContent = e.message; });
+}
+
+$('signin').onclick = function () { submitCredentials('sign-in/email'); };
+$('signup').onclick = function () { submitCredentials('sign-up/email'); };
+$('signout').onclick = function () {
+  authApi('sign-out', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(refreshSession);
+};
+
 function load(extra) {
   return fetch('/api/list').then(function (r) { return r.json(); }).then(function (d) {
     var objects = d.objects;
@@ -81,13 +151,17 @@ function load(extra) {
   });
 }
 
-document.getElementById('upload').onclick = function () {
-  var f = document.getElementById('file').files[0];
+$('upload').onclick = function () {
+  var f = $('file').files[0];
   if (!f) { statusEl.textContent = 'Choose an image first.'; return; }
   if (TYPES.indexOf(f.type) < 0) { statusEl.textContent = 'Only PNG, JPEG, WebP or GIF.'; return; }
   if (f.size > MAX) { statusEl.textContent = 'Max 2 MiB.'; return; }
   statusEl.textContent = 'Uploading...';
-  fetch('/api/upload-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentType: f.type, size: f.size }) })
+  refreshSession()
+    .then(function (jwt) {
+      if (!jwt) throw new Error('sign in again');
+      return fetch('/api/upload-url', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + jwt }, body: JSON.stringify({ contentType: f.type, size: f.size }) });
+    })
     .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.status); return j; }); })
     .then(function (p) {
       var form = new FormData();
@@ -102,6 +176,7 @@ document.getElementById('upload').onclick = function () {
     .catch(function (e) { statusEl.textContent = 'Failed: ' + e.message; });
 };
 
+refreshSession();
 load();
 </script>
 </body>

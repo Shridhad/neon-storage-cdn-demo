@@ -14,11 +14,13 @@ async function hmac(key, msg) {
 // The storage service accepts the SigV4 POST form: x-amz-signature = hex(HMAC-SHA256(signingKey, base64(policy))).
 // It checks bucket, key, Content-Type and content-length-range against the submitted form and rejects any
 // submitted field that no condition names. It does not store a Cache-Control form field, so none is sent.
-export async function buildUploadPolicy(env, contentType, now = new Date()) {
+export async function buildUploadPolicy(env, contentType, userId, now = new Date()) {
   const ext = EXTENSIONS[contentType];
   if (!ext) throw new Error(`unsupported content type: ${contentType}`);
 
-  const key = `uploads/${crypto.randomUUID()}.${ext}`;
+  // The uploader id lives in the key, which the policy already pins with an eq condition. An x-amz-meta-uploader
+  // field would need its own condition, and the stored metadata is not served on the public read path.
+  const key = `uploads/${userId}/${crypto.randomUUID()}.${ext}`;
   const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const day = amzDate.slice(0, 8);
   const credential = `${env.NEON_STORAGE_ACCESS_KEY_ID}/${day}/${env.REGION}/s3/aws4_request`;

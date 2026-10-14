@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end checks against the deployed demo.
 # Usage: ./e2e.sh https://<name>.<subdomain>.workers.dev [bucket]
-# Needs curl and jq. One run makes 3 /api/upload-url calls; the limiter allows 5 per minute per location,
-# so wait a minute between back-to-back runs.
+# Needs curl and jq. It signs up a throwaway user through the Worker's /api/auth proxy (email + password) and
+# uploads as that user. One run makes 4 authenticated /api/upload-url calls; the limiter allows 5 per minute
+# per location, so wait a minute between back-to-back runs. Throwaway users (e2e-*@example.com) stay in the
+# project's neon_auth schema.
 set -u
 
 BASE=${1:?usage: e2e.sh <worker-url> [bucket]}
@@ -20,11 +22,14 @@ check() { if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1: got '$2', want '$
 status_of() { head -n1 "$1" | tr -d '\r' | awk '{print $2}'; }
 header_of() { grep -i "^$2:" "$1" | tail -n1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//'; }
 
-# upload_url TYPE SIZE: writes the response to $tmp/up.json and prints the HTTP status. Waits out a 429 once.
+TOKEN=""
+# upload_url TYPE SIZE: writes the response to $tmp/up.json and prints the HTTP status. Sends $TOKEN as a bearer
+# token when set. Waits out a 429 once.
 upload_url() {
-  local code
+  local code auth=()
+  [ -n "$TOKEN" ] && auth=(-H "Authorization: Bearer $TOKEN")
   for _ in 1 2; do
-    code=$(curl -sS -o "$tmp/up.json" -w '%{http_code}' -X POST "$BASE/api/upload-url" \
+    code=$(curl -sS -o "$tmp/up.json" -w '%{http_code}' -X POST "$BASE/api/upload-url" ${auth[@]+"${auth[@]}"} \
       -H 'Content-Type: application/json' -d "{\"contentType\":\"$1\",\"size\":$2}")
     [ "$code" = 429 ] || break
     echo "      rate limited, waiting 61s" >&2; sleep 61
@@ -53,11 +58,33 @@ samples=$(jq '[.objects[] | select(.key | startswith("samples/"))] | length' "$t
 [ "${samples:-0}" -ge 1 ] && ok "GET /api/list returns $samples sample(s)" || bad "GET /api/list returned no samples"
 sample=$(jq -r '[.objects[] | select(.key | startswith("samples/"))][0].key' "$tmp/list.json")
 
-# 3. Upload through a presigned POST policy, then read it back through the CDN path.
+# 3. Uploads need a Neon Auth session.
+check "POST /api/upload-url without a token" "$(upload_url image/png 100)" 401
+check "POST /api/upload-url with a garbage token" "$(TOKEN=not.a.jwt upload_url image/png 100)" 401
+
+email="e2e-$(date +%s)-$RANDOM@example.com"
+password="E2e-$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')-pw1"
+auth_post() { # PATH JSON: POST through the Worker's auth proxy, keeping cookies in the jar
+  curl -sS -D "$tmp/hauth" -o "$tmp/auth.json" -w '%{http_code}' -c "$tmp/jar" -b "$tmp/jar" -H "Origin: $BASE" \
+    -H 'Content-Type: application/json' -d "$2" "$BASE/api/auth/$1"
+}
+check "sign up $email through /api/auth" "$(auth_post sign-up/email "$(jq -nc --arg e "$email" --arg p "$password" '{email:$e,password:$p,name:"e2e"}')")" 200
+user_id=$(jq -r '.user.id // empty' "$tmp/auth.json")
+[ -n "$user_id" ] && ok "sign-up returned a user id" || bad "sign-up returned no user id"
+grep -qi '^set-cookie: __Secure-neon-auth' "$tmp/hauth" && ok "sign-up set the session cookie" || bad "sign-up set no session cookie"
+if grep -i '^set-cookie:' "$tmp/hauth" | grep -qiE 'partitioned|samesite=none'; then bad "session cookie is still third-party style (Partitioned/SameSite=None)"; else ok "session cookie is first-party (no Partitioned, not SameSite=None)"; fi
+curl -sS -D "$tmp/hs" -o "$tmp/session.json" -b "$tmp/jar" "$BASE/api/auth/get-session"
+check "GET /api/auth/get-session" "$(status_of "$tmp/hs")" 200
+check "session email" "$(jq -r '.user.email' "$tmp/session.json")" "$email"
+TOKEN=$(header_of "$tmp/hs" set-auth-jwt)
+[ -n "$TOKEN" ] && ok "session yields a JWT (set-auth-jwt)" || bad "no set-auth-jwt header"
+check "auth proxy blocks routes outside the allowlist" "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/auth/admin/list-users")" 404
+
+# Upload through a presigned POST policy as that user, then read it back through the CDN path.
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==' | base64 -d >"$tmp/pixel.png"
 check "POST /api/upload-url (image/png)" "$(upload_url image/png "$(wc -c <"$tmp/pixel.png")")" 200
 key=$(jq -r .key "$tmp/up.json")
-case "$key" in uploads/*.png) ok "server chose the key ($key)";; *) bad "unexpected key '$key'";; esac
+case "$key" in "uploads/$user_id/"*.png) ok "server chose the key under the user id ($key)";; *) bad "unexpected key '$key'";; esac
 code=$(post_form "$tmp/pixel.png" image/png)
 case "$code" in 201|204) ok "multipart POST to storage ($code)";; *) bad "multipart POST to storage: $code $(head -c 200 "$tmp/post.out")";; esac
 
@@ -85,7 +112,7 @@ etag=$(header_of "$tmp/h4" etag)
 code=$(curl -sS -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag" "$SURL")
 check "If-None-Match $etag" "$code" 304
 
-# 5. Rejections.
+# 5. Rejections (still authenticated).
 check "oversize declared size is refused by the Worker" "$(upload_url image/png $((MAX + 1)))" 400
 check "non-image type is refused by the Worker" "$(upload_url text/html 100)" 400
 
